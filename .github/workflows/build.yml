@@ -1,0 +1,132 @@
+name: Build Executables
+
+# Runs automatically when you push a version tag  (e.g. git tag v1.0 && git push --tags)
+# Can also be triggered manually from the Actions tab in GitHub.
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+jobs:
+
+  # ── macOS .app bundle ───────────────────────────────────────────────────────
+  build-mac:
+    runs-on: macos-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install pillow certifi pyinstaller
+
+      - name: Build Mac app
+        run: |
+          python -m PyInstaller \
+            --onefile \
+            --windowed \
+            --name "MultimediaCookbookFactory" \
+            --hidden-import PIL \
+            --hidden-import PIL.Image \
+            --hidden-import PIL.ImageDraw \
+            --hidden-import PIL.ImageFilter \
+            --hidden-import PIL.ImageFont \
+            --hidden-import PIL.ImageTk \
+            --hidden-import certifi \
+            --hidden-import tkinter \
+            --hidden-import tkinter.ttk \
+            --hidden-import tkinter.colorchooser \
+            --hidden-import tkinter.filedialog \
+            --hidden-import tkinter.messagebox \
+            cookbook_factory.py
+
+      - name: Zip the .app bundle
+        run: |
+          cd dist
+          zip -r MultimediaCookbookFactory-Mac.zip MultimediaCookbookFactory.app
+
+      - name: Upload Mac artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: MultimediaCookbookFactory-Mac
+          path: dist/MultimediaCookbookFactory-Mac.zip
+
+  # ── Windows .exe ────────────────────────────────────────────────────────────
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install pillow certifi pyinstaller
+
+      - name: Build Windows exe
+        run: |
+          python -m PyInstaller `
+            --onefile `
+            --windowed `
+            --name "MultimediaCookbookFactory" `
+            --hidden-import PIL `
+            --hidden-import PIL.Image `
+            --hidden-import PIL.ImageDraw `
+            --hidden-import PIL.ImageFilter `
+            --hidden-import PIL.ImageFont `
+            --hidden-import PIL.ImageTk `
+            --hidden-import certifi `
+            cookbook_factory.py
+
+      - name: Upload Windows artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: MultimediaCookbookFactory-Windows
+          path: dist/MultimediaCookbookFactory.exe
+
+  # ── Create GitHub Release (only on version tags) ────────────────────────────
+  release:
+    needs: [build-mac, build-windows]
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/')
+    permissions:
+      contents: write
+    steps:
+      - name: Download Mac artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: MultimediaCookbookFactory-Mac
+
+      - name: Download Windows artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: MultimediaCookbookFactory-Windows
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: "Multimedia Cookbook Factory ${{ github.ref_name }}"
+          body: |
+            ## Multimedia Cookbook Factory ${{ github.ref_name }}
+
+            ### Downloads
+            | Platform | File | Notes |
+            |---|---|---|
+            | 🍎 macOS | `MultimediaCookbookFactory-Mac.zip` | Unzip → right-click → Open (first run) |
+            | 🪟 Windows | `MultimediaCookbookFactory.exe` | Run directly |
+
+            ### Requirements
+            - **FFmpeg** must be installed separately for video export:
+              - **Mac:** `brew install ffmpeg`
+              - **Windows:** Download from [ffmpeg.org](https://ffmpeg.org/download.html) or install [ShareX](https://getsharex.com/) (includes FFmpeg)
+          files: |
+            MultimediaCookbookFactory-Mac.zip
+            MultimediaCookbookFactory.exe
