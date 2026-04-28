@@ -700,17 +700,115 @@ def render_video_spread(img_path, recipe_name, text, font_path, color_hex,
 
 
 def render_cover(img_path, title, subtitle, font_path, w, h):
-    img  = fit_bg(img_path, w, h).convert("RGBA")
-    img.alpha_composite(gradient_band(w, 320, 180), (0, h - 320))
-    img  = img.convert("RGB")
+    """
+    Render the cover frame.
+    • The cover image is shown with object-fit:contain (no cropping) centred on a
+      dark blurred background — portrait book covers stay portrait.
+    • A strong gradient + text banner ensures title/subtitle are always readable.
+    """
+    src = Image.open(img_path).convert("RGB")
+
+    # ── blurred background (full frame, darkened) ────────────────────────────
+    bg = src.resize((w * 2, h * 2), Image.LANCZOS)
+    bg = bg.filter(ImageFilter.GaussianBlur(radius=32))
+    bg = bg.resize((w, h), Image.LANCZOS)
+    # darken background so text stands out
+    dark = Image.new("RGB", (w, h), (0, 0, 0))
+    bg   = Image.blend(bg, dark, 0.45)
+
+    # ── foreground: contain (no crop) centred ───────────────────────────────
+    ratio = src.width / src.height
+    if ratio > (w / h):          # wider than frame → fit by width
+        fw, fh = w, int(w / ratio)
+    else:                         # taller than frame → fit by height
+        fw, fh = int(h * ratio), h
+    fg = src.resize((fw, fh), Image.LANCZOS)
+    canvas = bg.copy()
+    canvas.paste(fg, ((w - fw) // 2, (h - fh) // 2))
+    canvas = canvas.convert("RGBA")
+
+    # ── gradient band at bottom for text legibility ──────────────────────────
+    canvas.alpha_composite(gradient_band(w, 420, 230), (0, h - 420))
+    img  = canvas.convert("RGB")
     draw = ImageDraw.Draw(img)
-    tf = load_font(font_path, 64 if w < 1000 else 82)
-    tb = draw.textbbox((0, 0), title, font=tf)
-    draw.text(((w-(tb[2]-tb[0]))//2, h-258), title, font=tf, fill=(255,252,245))
+
+    # ── title (auto-shrink to fit width) ────────────────────────────────────
+    max_tf = 88 if w >= 1920 else 64
+    for pt in range(max_tf, 36, -4):
+        tf = load_font(font_path, pt)
+        tb = draw.textbbox((0, 0), title, font=tf)
+        if tb[2] - tb[0] <= w - 120:
+            break
+    title_y = (h - 220) if subtitle else (h - 160)
+    draw.text(((w - (draw.textbbox((0,0),title,font=tf)[2]-draw.textbbox((0,0),title,font=tf)[0])) // 2,
+               title_y), title, font=tf, fill=(255, 252, 245))
+
+    # ── subtitle ─────────────────────────────────────────────────────────────
     if subtitle:
-        sf = load_font(font_path, 32 if w < 1000 else 40)
+        sf = load_font(font_path, 44 if w >= 1920 else 32)
         sb = draw.textbbox((0, 0), subtitle, font=sf)
-        draw.text(((w-(sb[2]-sb[0]))//2, h-152), subtitle, font=sf, fill=(215,207,190))
+        draw.text(((w - (sb[2]-sb[0])) // 2, h - 130),
+                  subtitle, font=sf, fill=(215, 207, 190))
+    return img
+
+
+def render_back_cover(img_path, chef_name, chef_bio, chef_photo, font_path, w, h):
+    """
+    Render the back-cover frame.
+    • Same contain + blurred-bg treatment as render_cover.
+    • Right-side panel shows About the Chef, name and bio.
+    """
+    src = Image.open(img_path).convert("RGB")
+
+    # ── blurred darkened background ──────────────────────────────────────────
+    bg = src.resize((w * 2, h * 2), Image.LANCZOS)
+    bg = bg.filter(ImageFilter.GaussianBlur(radius=32))
+    bg = bg.resize((w, h), Image.LANCZOS)
+    dark = Image.new("RGB", (w, h), (0, 0, 0))
+    bg   = Image.blend(bg, dark, 0.35)
+
+    # ── foreground: contain ──────────────────────────────────────────────────
+    ratio = src.width / src.height
+    if ratio > (w / h):
+        fw, fh = w, int(w / ratio)
+    else:
+        fw, fh = int(h * ratio), h
+    fg = src.resize((fw, fh), Image.LANCZOS)
+    canvas = bg.copy()
+    canvas.paste(fg, ((w - fw) // 2, (h - fh) // 2))
+    img  = canvas.convert("RGB")
+
+    # ── right-side chef panel ────────────────────────────────────────────────
+    pw    = min(520, w // 2)
+    panel = Image.new("RGBA", (pw, h), (252, 248, 240, 240))
+    img   = img.convert("RGBA")
+    img.alpha_composite(panel, (w - pw, 0))
+    img   = img.convert("RGB")
+    draw  = ImageDraw.Draw(img)
+    px, py = w - pw + 44, 60
+
+    # Chef photo (circular)
+    if chef_photo and Path(chef_photo).exists():
+        ap   = Image.open(chef_photo).convert("RGB").resize((160, 160), Image.LANCZOS)
+        mask = Image.new("L", (160, 160), 0)
+        ImageDraw.Draw(mask).ellipse((0, 0, 160, 160), fill=255)
+        img.paste(ap, (w - pw + (pw - 160) // 2, py), mask)
+        py += 190
+
+    draw.text((px, py), "About the Chef",
+              font=load_font(font_path, 26), fill=(108, 80, 50))
+    py += 48
+    draw.text((px, py), chef_name,
+              font=load_font(font_path, 40), fill=(38, 26, 14))
+    py += 62
+
+    bio_font, bio_lines = wrap_and_fit(
+        chef_bio, font_path, max_pt=26, min_pt=16,
+        box_w=pw - 88, box_h=h - py - 40)
+    lh = int(bio_font.size * 1.65)
+    for line in bio_lines:
+        draw.text((px, py), line, font=bio_font, fill=(52, 38, 22))
+        py += lh if line else lh // 2
     return img
 
 
@@ -1079,7 +1177,8 @@ button:hover{{background:#d4922a;box-shadow:0 3px 10px rgba(0,0,0,.55)}}
 <div id="xpanel"></div>
 <script>
 const PG_BG="{cfg['page_bg_color']}",TC="{tc}",FONT="{fn}",
-      PG_DARK={pg_dark:.2f},TITLE="{title_e}",
+      PG_DARK={pg_dark:.2f},TITLE="{title_e}",SUBTITLE="{sub_e}",
+      CHEF_NAME="{chef_name}",CHEF_BIO={__import__('json').dumps(cfg['author_bio'])},
       COVER="{cover_src}",BACK="{back_src}";
 const SPREADS={spreads_data};
 const PW=1920,PH=1080;
@@ -1151,12 +1250,69 @@ async function dlPDF(){{
     const c=await html2canvas(el,{{scale:1,useCORS:true,width:PW,height:PH}});
     return c.toDataURL('image/jpeg',0.88);
   }}
-  function imgSlide(src){{
+  /* Cover slide — image fills frame, title + subtitle overlaid on dark gradient */
+  function coverSlide(src,title,subtitle){{
     const d=document.createElement('div');
-    d.style.cssText=`width:${{PW}}px;height:${{PH}}px;overflow:hidden`;
+    d.style.cssText=`width:${{PW}}px;height:${{PH}}px;overflow:hidden;position:relative;background:#0a0604`;
     const im=document.createElement('img');
-    im.src=src;im.style.cssText=`width:100%;height:100%;object-fit:cover`;
-    d.appendChild(im);return d;
+    im.src=src;
+    im.style.cssText=`width:100%;height:100%;object-fit:contain;position:absolute;top:0;left:0`;
+    d.appendChild(im);
+    /* dark gradient at bottom */
+    const gr=document.createElement('div');
+    gr.style.cssText=`position:absolute;bottom:0;left:0;right:0;height:420px;`+
+      `background:linear-gradient(transparent,rgba(0,0,0,.88))`;
+    d.appendChild(gr);
+    /* title */
+    const ti=document.createElement('div');
+    const titleBottom=subtitle?220:140;
+    ti.style.cssText=`position:absolute;bottom:${{titleBottom}}px;width:100%;text-align:center;`+
+      `font-size:78px;font-style:italic;font-weight:bold;color:#faf8f2;`+
+      `font-family:'${{FONT}}',Georgia,serif;`+
+      `text-shadow:2px 3px 14px rgba(0,0,0,.95);padding:0 80px;box-sizing:border-box`;
+    ti.textContent=title;
+    d.appendChild(ti);
+    /* subtitle */
+    if(subtitle){{
+      const si=document.createElement('div');
+      si.style.cssText=`position:absolute;bottom:140px;width:100%;text-align:center;`+
+        `font-size:42px;color:#ddd5be;font-family:'${{FONT}}',Georgia,serif;`+
+        `text-shadow:1px 2px 8px rgba(0,0,0,.9);padding:0 80px;box-sizing:border-box`;
+      si.textContent=subtitle;
+      d.appendChild(si);
+    }}
+    return d;
+  }}
+  /* Back cover slide — image fills frame, chef panel on the right */
+  function backCoverSlide(src,chefName,chefBio){{
+    const d=document.createElement('div');
+    d.style.cssText=`width:${{PW}}px;height:${{PH}}px;overflow:hidden;position:relative;background:#0a0604`;
+    const im=document.createElement('img');
+    im.src=src;
+    im.style.cssText=`width:100%;height:100%;object-fit:cover;position:absolute;top:0;left:0`;
+    d.appendChild(im);
+    /* semi-opaque panel on the right */
+    const panel=document.createElement('div');
+    panel.style.cssText=`position:absolute;right:0;top:0;bottom:0;width:520px;`+
+      `background:rgba(252,248,240,.94);padding:52px 44px 40px;`+
+      `display:flex;flex-direction:column;overflow:hidden;box-sizing:border-box;`+
+      `font-family:'${{FONT}}',Georgia,serif`;
+    const head=document.createElement('div');
+    head.style.cssText=`font-size:22px;color:#8a5e38;font-style:italic;`+
+      `border-bottom:1px solid #d8cfc0;padding-bottom:10px;margin-bottom:16px`;
+    head.textContent='About the Chef';
+    panel.appendChild(head);
+    const nm=document.createElement('div');
+    nm.style.cssText=`font-size:30px;font-weight:bold;color:#2c1810;margin-bottom:18px`;
+    nm.textContent=chefName;
+    panel.appendChild(nm);
+    const bio=document.createElement('div');
+    bio.style.cssText=`font-size:17px;line-height:1.85;color:#4a3520;`+
+      `white-space:pre-wrap;word-wrap:break-word;overflow:hidden;flex:1`;
+    bio.textContent=chefBio;
+    panel.appendChild(bio);
+    d.appendChild(panel);
+    return d;
   }}
   function recipeSlide(sp){{
     const entry=localStorage.getItem(sp.key)||'';
@@ -1195,7 +1351,7 @@ async function dlPDF(){{
     d.appendChild(ph);d.appendChild(wr);return d;
   }}
   try{{
-    let data=await addImg(imgSlide(COVER));
+    let data=await addImg(coverSlide(COVER,TITLE,SUBTITLE));
     pdf.addImage(data,'JPEG',0,0,PW,PH);
     for(const sp of SPREADS){{
       pdf.addPage([PW,PH],'landscape');
@@ -1203,7 +1359,7 @@ async function dlPDF(){{
       pdf.addImage(data,'JPEG',0,0,PW,PH);
     }}
     pdf.addPage([PW,PH],'landscape');
-    data=await addImg(imgSlide(BACK));
+    data=await addImg(backCoverSlide(BACK,CHEF_NAME,CHEF_BIO));
     pdf.addImage(data,'JPEG',0,0,PW,PH);
     pdf.save(TITLE.replace(/[^a-z0-9]/gi,'_')+'.pdf');
   }}catch(e){{
