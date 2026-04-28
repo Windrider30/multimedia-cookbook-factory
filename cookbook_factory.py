@@ -2375,6 +2375,31 @@ class App(tk.Tk):
             self._photos[self._sel]["name"] = self.v_recipe_name.get()
             self._refresh_lb()
 
+    def _run_threaded(self, func, message="Please wait…"):
+        """
+        Run func() in a daemon thread while showing a _BusyDialog overlay.
+        wait_window() blocks execution here but keeps tkinter event loop alive
+        so the UI never freezes.  Returns the result or re-raises any exception.
+        """
+        busy   = _BusyDialog(self, message)
+        result = [None]
+        error  = [None]
+
+        def _worker():
+            try:
+                result[0] = func()
+            except Exception as exc:
+                error[0] = exc
+            finally:
+                self.after(0, busy.destroy)
+
+        threading.Thread(target=_worker, daemon=True).start()
+        self.wait_window(busy)   # returns when busy.destroy() is called
+
+        if error[0] is not None:
+            raise error[0]
+        return result[0]
+
     def _change_photo(self):
         """Replace the photo for the currently selected recipe page."""
         if self._sel is None:
@@ -2389,9 +2414,9 @@ class App(tk.Tk):
 
     def _import_from_file(self):
         """
-        Parse a .txt / .docx / .pdf into recipes, then open ImportDialog
-        so the user can assign photos before adding them to the project.
-        Handles scanned PDFs by extracting embedded images as photo slots.
+        Load recipes from .csv/.txt/.docx/.pdf.
+        All slow I/O (parsing, image extraction, URL downloads) runs in a
+        background thread via _run_threaded() so the UI never freezes.
         """
         ft = [
             ("Recipe files",   "*.csv *.txt *.docx *.pdf"),
@@ -2405,101 +2430,89 @@ class App(tk.Tk):
         if not f:
             return
 
-        self.configure(cursor="watch")
-        self.update()
+        # ── Step 1: parse the file (threaded — never blocks UI) ────────────────
         try:
-            recipes = parse_recipes_from_file(f)
+            recipes = self._run_threaded(
+                lambda: parse_recipes_from_file(f),
+                f"Reading {Path(f).name} …")
         except Exception as e:
-            self.configure(cursor="")
             messagebox.showerror("Error reading file", str(e), parent=self)
             return
-        self.configure(cursor="")
 
         pdf_path    = Path(f) if f.lower().endswith(".pdf") else None
         preset_imgs = []
 
-        # ── CSV: download any photo URLs before opening the dialog ──────────────
+        # ── Step 2 (CSV only): download photo URLs ─────────────────────────────
         if f.lower().endswith(".csv") and recipes:
-            urls_found = [r.get("photo_url","").strip() for r in recipes]
-            has_urls   = any(u.startswith(("http://","https://")) for u in urls_found)
-            if has_urls:
-                # Save into output folder / _csv_photos, or next to the CSV
+            urls_found = [r.get("photo_url", "").strip() for r in recipes]
+            n_urls     = sum(1 for u in urls_found if u.startswith(("http://", "https://")))
+            if n_urls:
                 out_base = self.v_output.get().strip()
                 dl_dir   = (Path(out_base) if out_base else Path(f).parent) / "_csv_photos"
                 dl_dir.mkdir(parents=True, exist_ok=True)
 
-                n_urls = sum(1 for u in urls_found if u.startswith(("http://","https://")))
-                if not messagebox.askyesno(
+                if messagebox.askyesno(
                         "Download photos from URLs?",
-                        f"Found {n_urls} photo URL{'s' if n_urls!=1 else ''} in the CSV.\n\n"
+                        f"Found {n_urls} photo URL{'s' if n_urls != 1 else ''} in the CSV.\n\n"
                         f"Download them now?\n"
-                        f"They will be saved to:\n  {dl_dir}",
+                        f"Saved to:  {dl_dir}",
                         parent=self):
-                    # User said no — keep URLs as-is but don't download
-                    pass
-                else:
-                    self.configure(cursor="watch")
-                    self.update()
-                    downloaded = []
-                    for idx, url in enumerate(urls_found):
-                        if url.startswith(("http://","https://")):
-                            p = _download_photo(url, dl_dir, idx + 1)
-                            downloaded.append(p)   # None if download failed
-                        else:
-                            downloaded.append(None)
-                    self.configure(cursor="")
 
+                    def _do_downloads():
+                        out = []
+                        for idx, url in enumerate(urls_found):
+                            if url.startswith(("http://", "https://")):
+                                out.append(_download_photo(url, dl_dir, idx + 1))
+                            else:
+                                out.append(None)
+                        return out
+
+                    downloaded  = self._run_threaded(
+                        _do_downloads,
+                        f"Downloading {n_urls} photo{'s' if n_urls != 1 else ''} …")
                     ok  = sum(1 for p in downloaded if p is not None)
                     bad = n_urls - ok
-                    # Keep per-recipe alignment: None slots stay empty in the dialog
-                    preset_imgs = downloaded   # list of Path-or-None, one per recipe
+                    preset_imgs = downloaded   # per-recipe; None = blank slot
 
-                    msg = f"Downloaded {ok} of {n_urls} photo{'s' if n_urls!=1 else ''}."
+                    msg = f"Downloaded {ok} of {n_urls} photo{'s' if n_urls != 1 else ''}."
                     if bad:
-                        msg += f"\n{bad} failed — you can assign those manually in the next step."
+                        msg += f"\n{bad} failed — assign those manually in the next step."
                     messagebox.showinfo("Photos downloaded", msg, parent=self)
 
-        # ── Scanned PDF: recipes is None (no extractable text) ─────────────────
-        if recipes is None:
-            # Work out where to save extracted images — user's output folder,
-            # or a subfolder next to the PDF if no output folder is set yet.
+        # ── Step 3 (scanned PDF): extract embedded images ──────────────────────
+        elif recipes is None:
             out_base = self.v_output.get().strip()
-            if out_base:
-                pdf_img_dir = Path(out_base) / "_pdf_import"
-            else:
-                pdf_img_dir = Path(f).parent / "_pdf_import"
+            pdf_img_dir = (Path(out_base) if out_base else Path(f).parent) / "_pdf_import"
             pdf_img_dir.mkdir(parents=True, exist_ok=True)
 
-            # Extract embedded images from the PDF pages
-            self.configure(cursor="watch")
-            self.update()
-            imgs = extract_images_from_pdf(Path(f), output_dir=pdf_img_dir)
-            self.configure(cursor="")
+            imgs = self._run_threaded(
+                lambda: extract_images_from_pdf(Path(f), output_dir=pdf_img_dir),
+                "Extracting images from scanned PDF …")
 
             if not imgs:
                 messagebox.showerror(
                     "Scanned PDF — no images found",
-                    "This PDF contains scanned pages (images, not text) and no\n"
-                    "extractable embedded images were found either.\n\n"
+                    "This PDF contains scanned pages (image-based, not text) and\n"
+                    "no extractable embedded images were found.\n\n"
                     "Options:\n"
                     "  • Export the PDF pages as JPG/PNG images and use\n"
-                    "    'Load Folder' or 'Add Photos' instead.\n"
+                    "    'Load Folder' or 'Add Photos' to bring them in.\n"
                     "  • Use a PDF with selectable text for recipe content.",
                     parent=self)
                 return
 
-            # One blank recipe slot per extracted image
-            recipes     = [{"name": f"Recipe {i+1}", "text": ""} for i in range(len(imgs))]
+            recipes     = [{"name": f"Recipe {i+1}", "text": "", "photo_url": ""}
+                           for i in range(len(imgs))]
             preset_imgs = imgs
             messagebox.showinfo(
                 "Scanned PDF detected",
-                f"This PDF is scanned (image-based), so recipe text could not be read.\n\n"
-                f"Found {len(imgs)} embedded image{'s' if len(imgs)!=1 else ''} — "
+                f"This PDF is scanned (image-based) — recipe text could not be read.\n\n"
+                f"Found {len(imgs)} embedded image{'s' if len(imgs) != 1 else ''} — "
                 f"each has been assigned as a recipe photo.\n\n"
-                f"Enter the recipe name and content for each page in the editor after importing.",
+                f"Fill in the recipe names and content in the editor after importing.",
                 parent=self)
 
-        # ── Normal case: no recipes detected in a text file ────────────────────
+        # ── Step 4 (text files): no recognisable recipe sections ───────────────
         elif not recipes:
             messagebox.showinfo(
                 "No recipes found",
@@ -2511,13 +2524,14 @@ class App(tk.Tk):
                 parent=self)
             return
 
-        dlg = ImportDialog(self, recipes, pdf_path=pdf_path, preset_photos=preset_imgs)
+        # ── Step 5: show ImportDialog for photo assignment ─────────────────────
+        dlg      = ImportDialog(self, recipes, pdf_path=pdf_path, preset_photos=preset_imgs)
         imported = dlg.result
         if not imported:
             return
 
         existing = {ph["path"] for ph in self._photos}
-        added = 0
+        added    = 0
         for ph in imported:
             if ph["path"] not in existing:
                 self._photos.append(ph)
@@ -2531,7 +2545,7 @@ class App(tk.Tk):
         messagebox.showinfo(
             "Recipes imported",
             f"Added {added} recipe{'s' if added != 1 else ''} to your cookbook.\n"
-            "You can now edit names, content, or swap photos in the editor on the right.",
+            "You can edit names, content, or swap photos in the editor on the right.",
             parent=self)
 
     # ── build ────────────────────────────────────────────────────────────────────
@@ -2637,6 +2651,29 @@ class App(tk.Tk):
         self._log_widget.configure(state="normal")
         self._log_widget.delete("1.0","end")
         self._log_widget.configure(state="disabled")
+
+
+# ── busy overlay ───────────────────────────────────────────────────────────────
+
+class _BusyDialog(tk.Toplevel):
+    """
+    Small borderless modal overlay shown while background work runs.
+    Stays alive and processes events so tkinter never freezes.
+    """
+    def __init__(self, parent, message="Please wait…"):
+        super().__init__(parent)
+        self.overrideredirect(True)
+        self.configure(bg=PANEL, bd=2, relief="solid")
+        tk.Label(self, text=message, bg=PANEL, fg=FG,
+                 font=("Segoe UI", 11), padx=32, pady=20).pack()
+        self.transient(parent)
+        self.grab_set()
+        self.update_idletasks()
+        pw, ph = parent.winfo_width(), parent.winfo_height()
+        px, py = parent.winfo_rootx(), parent.winfo_rooty()
+        w, h   = self.winfo_width(), self.winfo_height()
+        self.geometry(f"+{px + (pw - w)//2}+{py + (ph - h)//2}")
+        self.update()
 
 
 # ── import dialog ──────────────────────────────────────────────────────────────
@@ -2838,13 +2875,17 @@ class ImportDialog(tk.Toplevel):
     def _extract_pdf_photos(self):
         if not self._pdf_path:
             return
-        # Save extracted images alongside the PDF so nothing lands on C:
         pdf_img_dir = self._pdf_path.parent / "_pdf_import"
         pdf_img_dir.mkdir(parents=True, exist_ok=True)
-        self.configure(cursor="watch")
-        self.update()
-        imgs = extract_images_from_pdf(self._pdf_path, output_dir=pdf_img_dir)
-        self.configure(cursor="")
+        # Run in background so the dialog doesn't freeze
+        busy = _BusyDialog(self, "Extracting images from PDF …")
+        result = [None]
+        def _worker():
+            result[0] = extract_images_from_pdf(self._pdf_path, output_dir=pdf_img_dir)
+            self.after(0, busy.destroy)
+        threading.Thread(target=_worker, daemon=True).start()
+        self.wait_window(busy)
+        imgs = result[0] or []
         if not imgs:
             messagebox.showinfo(
                 "No images found",
