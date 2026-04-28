@@ -398,9 +398,14 @@ def _download_photo(url, save_dir, index, log=None):
     url = url.strip()
     try:
         # SSL: try certifi first, then unverified fallback
+        # Use a browser UA — many CDNs return 403 for Python's default UA
+        _UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+               "AppleWebKit/537.36 (KHTML, like Gecko) "
+               "Chrome/124.0.0.0 Safari/537.36")
         def _fetch(ctx=None):
-            kw = {"context": ctx} if ctx else {}
-            with urllib.request.urlopen(url, timeout=30, **kw) as resp:
+            req = urllib.request.Request(url, headers={"User-Agent": _UA})
+            kw  = {"context": ctx} if ctx else {}
+            with urllib.request.urlopen(req, timeout=30, **kw) as resp:
                 data         = resp.read()
                 content_type = resp.headers.get("Content-Type", "").split(";")[0].strip()
                 return data, content_type
