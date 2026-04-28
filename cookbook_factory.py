@@ -313,17 +313,37 @@ def _split_into_recipes(text):
 def _read_csv(path):
     """
     Parse a CSV file into recipe dicts.
-    Detects columns by header name (case-insensitive) with positional fallback.
+
+    Column detection uses SUBSTRING matching (case-insensitive) with priority
+    ordering — so headers like "Full Recipe (Under 5000 Characters)" and
+    "Link to photo" are found automatically regardless of extra words.
+
+    Falls back to column position if no header matches.
     Returns: [{"name": str, "text": str, "photo_url": str}, ...]
     """
     import csv
 
-    _NAME_COLS    = {"name","title","recipe_name","recipe name","recipe"}
-    _CONTENT_COLS = {"content","description","text","ingredients","body",
-                     "recipe_text","recipe text","instructions","recipe_content",
-                     "directions","method"}
-    _PHOTO_COLS   = {"photo","image","photo_url","image_url","url","link",
-                     "photo_link","image_link","picture","picture_url","img","img_url"}
+    # Keywords checked in priority order (most specific first).
+    # A column matches if its header CONTAINS the keyword as a substring.
+    _NAME_KW    = ["recipe title", "recipe name", "dish title", "dish name",
+                   "title", "name"]
+    _CONTENT_KW = ["full recipe", "recipe text", "recipe content", "recipe (",
+                   "ingredient", "instruction", "direction", "method",
+                   "description", "content", "body", "recipe"]
+    _PHOTO_KW   = ["link to photo", "photo url", "photo link",
+                   "image url",  "image link",
+                   "photo", "picture", "img"]
+    # Note: "image" alone is intentionally excluded — "Image Prompt" (AI prompt
+    # columns) would false-positive. "image url" / "image link" are fine.
+
+    def _find_col(lower_map, kw_list, exclude=None):
+        """Return first original column name whose lower header contains a kw."""
+        exclude = exclude or set()
+        for kw in kw_list:
+            for h_lower, h_orig in lower_map.items():
+                if kw in h_lower and h_orig not in exclude:
+                    return h_orig
+        return None
 
     with open(path, newline="", encoding="utf-8-sig", errors="replace") as fh:
         sample = fh.read(8192); fh.seek(0)
@@ -336,22 +356,23 @@ def _read_csv(path):
         if not reader.fieldnames:
             raise ValueError("CSV has no header row or could not be read.")
 
-        # Map lower-cased header → original header
-        lower_map = {fn.strip().lower(): fn for fn in reader.fieldnames if fn}
+        lower_map = {fn.strip().lower(): fn
+                     for fn in reader.fieldnames if fn and fn.strip()}
 
-        name_col    = next((lower_map[k] for k in _NAME_COLS    if k in lower_map), None)
-        content_col = next((lower_map[k] for k in _CONTENT_COLS if k in lower_map), None)
-        photo_col   = next((lower_map[k] for k in _PHOTO_COLS   if k in lower_map), None)
+        name_col    = _find_col(lower_map, _NAME_KW)
+        content_col = _find_col(lower_map, _CONTENT_KW,    exclude={name_col})
+        photo_col   = _find_col(lower_map, _PHOTO_KW,      exclude={name_col, content_col})
 
-        # Positional fallback if headers weren't recognised
-        cols = [fn for fn in reader.fieldnames if fn]
-        if not name_col    and len(cols) >= 1: name_col    = cols[0]
-        if not content_col and len(cols) >= 2: content_col = cols[1]
-        if not photo_col   and len(cols) >= 3: photo_col   = cols[2]
+        # Positional fallback — only for columns not already claimed
+        cols    = [fn for fn in reader.fieldnames if fn and fn.strip()]
+        claimed = {c for c in (name_col, content_col, photo_col) if c}
+        free    = [c for c in cols if c not in claimed]
+        if not name_col    and len(free) >= 1: name_col    = free[0]
+        if not content_col and len(free) >= 2: content_col = free[1]
+        if not photo_col   and len(free) >= 3: photo_col   = free[2]
 
         recipes = []
         for row in reader:
-            # `or ""` guards against None when a cell is blank in csv.DictReader
             name      = (row.get(name_col)    or "").strip() if name_col    else ""
             text      = (row.get(content_col) or "").strip() if content_col else ""
             photo_url = (row.get(photo_col)   or "").strip() if photo_col   else ""
