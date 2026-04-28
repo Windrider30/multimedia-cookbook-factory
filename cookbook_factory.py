@@ -108,6 +108,231 @@ def _get_js(name, log=None):
     return content
 
 
+# ── recipe file parser ─────────────────────────────────────────────────────────
+
+def _read_docx(path):
+    """Extract text from .docx, promoting heading paragraphs to markdown headers."""
+    try:
+        import docx
+    except ImportError:
+        raise RuntimeError(
+            "python-docx is not installed.\nRun:  pip install python-docx\n"
+            "Then restart the app.")
+    doc = docx.Document(str(path))
+    lines = []
+    for para in doc.paragraphs:
+        t = para.text
+        if not t.strip():
+            lines.append("")
+            continue
+        style = (para.style.name or "").lower() if para.style else ""
+        if "heading 1" in style or "title" in style:
+            lines.append(f"# {t.strip()}")
+        elif "heading 2" in style:
+            lines.append(f"## {t.strip()}")
+        else:
+            lines.append(t)
+    return "\n".join(lines)
+
+
+def _read_pdf(path):
+    """Extract plain text from a PDF using pypdf."""
+    try:
+        import pypdf
+    except ImportError:
+        raise RuntimeError(
+            "pypdf is not installed.\nRun:  pip install pypdf\n"
+            "Then restart the app.")
+    parts = []
+    with open(path, "rb") as fh:
+        reader = pypdf.PdfReader(fh)
+        for page in reader.pages:
+            parts.append(page.extract_text() or "")
+    return "\n".join(parts)
+
+
+def extract_images_from_pdf(path, log=None):
+    """
+    Extract all embedded images from a PDF into a temp folder.
+    Returns sorted list of Path objects.
+    Uses pypdf >= 3.x  page.images API.
+    """
+    try:
+        import pypdf
+    except ImportError:
+        return []
+
+    import tempfile
+    out_dir = Path(tempfile.mkdtemp(prefix="cb_pdf_imgs_"))
+    saved   = []
+
+    try:
+        with open(path, "rb") as fh:
+            reader = pypdf.PdfReader(fh)
+            for pg_num, page in enumerate(reader.pages):
+                try:
+                    page_imgs = page.images          # pypdf >= 3.0
+                except AttributeError:
+                    continue                          # older pypdf — skip
+                for img_obj in page_imgs:
+                    try:
+                        safe_name = re.sub(r'[^\w\-.]', '_', img_obj.name or "img")
+                        out_path  = out_dir / f"p{pg_num:03d}_{safe_name}"
+                        # Ensure a supported image extension
+                        if not out_path.suffix.lower() in SUPPORTED_IMG:
+                            out_path = out_path.with_suffix(".png")
+                        img_obj.image.save(str(out_path))
+                        saved.append(out_path)
+                        if log:
+                            log(f"  Extracted: {out_path.name}")
+                    except Exception:
+                        pass
+    except Exception:
+        pass
+
+    return sorted(saved, key=lambda p: p.name)
+
+
+def _is_title_line(line, next_line=""):
+    """Return True if this line looks like a recipe title."""
+    s = line.strip()
+    if not s or len(s) > 80:
+        return False
+    # Underlined header (next line is --- or ===)
+    if next_line and re.match(r'^[-=]{3,}\s*$', next_line.strip()):
+        return True
+    # Markdown header
+    if re.match(r'^#{1,3}\s+\S', s):
+        return True
+    # Numbered: "1. Name" or "1) Name"
+    if re.match(r'^\d+[\.\)]\s+\S', s) and len(s) < 80:
+        return True
+    # "Recipe N:" pattern
+    if re.match(r'^Recipe\s+\d+\s*[:\-]', s, re.IGNORECASE):
+        return True
+    return False
+
+
+def _clean_title(line):
+    """Strip markdown #, leading numbers, etc. from a detected title line."""
+    s = line.strip()
+    s = re.sub(r'^#{1,3}\s+', '', s)
+    s = re.sub(r'^\d+[\.\)]\s+', '', s)
+    s = re.sub(r'^Recipe\s+\d+\s*[:\-]\s*', '', s, flags=re.IGNORECASE)
+    return s.strip()
+
+
+def _split_by_allcaps(text):
+    """Fallback splitter: ALL-CAPS short lines become recipe headers."""
+    lines  = text.splitlines()
+    result = []
+    cur_name, cur_body = "", []
+
+    def _flush():
+        body = "\n".join(cur_body).strip()
+        if cur_name or body:
+            result.append({"name": cur_name, "text": body})
+
+    for line in lines:
+        s = line.strip()
+        if (s and s == s.upper() and 6 <= len(s) <= 60
+                and not re.match(r'^[-=*\s\d]+$', s)
+                and not re.match(r'^(NOTE|TIP|TIPS|YIELD|SERVES|MAKES)\b', s)):
+            _flush()
+            cur_name = s.title()   # ALL CAPS → Title Case
+            cur_body = []
+        else:
+            cur_body.append(line)
+    _flush()
+    return result
+
+
+def _split_into_recipes(text):
+    """Split raw text into [{"name": str, "text": str}, ...]."""
+    lines = text.splitlines()
+    N     = len(lines)
+    result, cur_name, cur_body = [], "", []
+
+    def _flush():
+        body = "\n".join(cur_body).strip()
+        if cur_name or body:
+            result.append({"name": cur_name, "text": body})
+
+    i = 0
+    while i < N:
+        line = lines[i]
+        nxt  = lines[i + 1] if i + 1 < N else ""
+
+        # Bare separator line: ---, ===, ***
+        if re.match(r'^[-=*]{3,}\s*$', line.strip()):
+            _flush()
+            cur_name, cur_body = "", []
+            i += 1
+            # Skip blanks; next non-blank may be a name
+            while i < N and not lines[i].strip():
+                i += 1
+            if i < N:
+                nxt2 = lines[i + 1] if i + 1 < N else ""
+                if _is_title_line(lines[i], nxt2):
+                    cur_name = _clean_title(lines[i])
+                    i += 1
+                    if i < N and re.match(r'^[-=]{3,}\s*$', lines[i].strip()):
+                        i += 1   # skip underline
+                else:
+                    cur_body.append(lines[i])
+                    i += 1
+            continue
+
+        # Title line (markdown, numbered, underlined)
+        if _is_title_line(line, nxt):
+            _flush()
+            cur_name, cur_body = _clean_title(line), []
+            i += 1
+            # Skip underline
+            if i < N and re.match(r'^[-=]{3,}\s*$', lines[i].strip()):
+                i += 1
+            continue
+
+        cur_body.append(line)
+        i += 1
+
+    _flush()
+
+    # Fallback: if we got only 1 recipe and text is long, try ALL-CAPS split
+    if len(result) <= 1 and len(text) > 400:
+        caps = _split_by_allcaps(text)
+        if len(caps) > 1:
+            return caps
+
+    return result if result else [{"name": "", "text": text.strip()}]
+
+
+def parse_recipes_from_file(path):
+    """
+    Parse a .txt, .docx, or .pdf file into recipe dicts.
+    Returns: [{"name": str, "text": str}, ...]
+    """
+    path   = Path(path)
+    suffix = path.suffix.lower()
+
+    if suffix == ".txt":
+        raw = path.read_text(encoding="utf-8", errors="replace")
+    elif suffix == ".docx":
+        raw = _read_docx(path)
+    elif suffix == ".pdf":
+        raw = _read_pdf(path)
+    else:
+        raise ValueError(
+            f"Unsupported file type: {suffix}\nSupported formats: .txt  .docx  .pdf")
+
+    if not raw.strip():
+        raise ValueError("The file appears to be empty or has no readable text.")
+
+    return _split_into_recipes(raw)
+
+
+# ───────────────────────────────────────────────────────────────────────────────
+
 _FFMPEG_FALLBACKS = [r"C:\Program Files\ShareX\ffmpeg.exe"]
 
 def _find_ffmpeg():
@@ -1163,11 +1388,12 @@ class App(tk.Tk):
 
         bar = tk.Frame(p, bg=CARD, pady=6)
         bar.grid(row=0, column=0, columnspan=2, sticky="ew", padx=10)
-        _btn(bar, "📁  Load Folder", self._load_folder).pack(side="left", padx=4)
-        _btn(bar, "+ Add Photos",    self._add_photos).pack(side="left", padx=4)
-        _btn(bar, "✕  Clear All",    self._clear_photos, danger=True).pack(side="left", padx=4)
+        _btn(bar, "📁  Load Folder",     self._load_folder).pack(side="left", padx=4)
+        _btn(bar, "+ Add Photos",        self._add_photos).pack(side="left", padx=4)
+        _btn(bar, "📄  Load from File",  self._import_from_file).pack(side="left", padx=4)
+        _btn(bar, "✕  Clear All",        self._clear_photos, danger=True).pack(side="left", padx=4)
         tk.Label(bar,
-                 text="  Each photo = one recipe page.  Select a page, enter the recipe name and content.",
+                 text="  Load Folder / Add Photos for images · Load from File imports .txt/.docx/.pdf recipes",
                  bg=CARD, fg=MUTED, font=("Segoe UI",8)).pack(side="left", padx=8)
 
         left = tk.Frame(p, bg=CARD, width=270)
@@ -1246,6 +1472,9 @@ class App(tk.Tk):
                  text="Enter the recipe name below, then add ingredients & instructions.",
                  bg=CARD, fg=MUTED, font=("Segoe UI",8), justify="left",
                  ).grid(row=1, column=1, sticky="w", pady=(4,0))
+
+        self._change_photo_btn = _btn(thumb_row, "📷  Change Photo…", self._change_photo)
+        self._change_photo_btn.grid(row=2, column=1, sticky="w", pady=(6,0))
 
         # Recipe Name field  (row 2)
         rn_frame = tk.Frame(right, bg=CARD)
@@ -1832,6 +2061,79 @@ class App(tk.Tk):
             self._photos[self._sel]["name"] = self.v_recipe_name.get()
             self._refresh_lb()
 
+    def _change_photo(self):
+        """Replace the photo for the currently selected recipe page."""
+        if self._sel is None:
+            return
+        f = filedialog.askopenfilename(
+            title="Select a new photo for this recipe",
+            filetypes=[("Images", "*.jpg *.jpeg *.png *.webp *.bmp *.tiff"), ("All", "*.*")])
+        if f:
+            self._photos[self._sel]["path"] = Path(f)
+            self._load_editor()
+            self._refresh_lb()
+
+    def _import_from_file(self):
+        """
+        Parse a .txt / .docx / .pdf into recipes, then open ImportDialog
+        so the user can assign photos before adding them to the project.
+        """
+        ft = [
+            ("Recipe files",  "*.txt *.docx *.pdf"),
+            ("Text files",    "*.txt"),
+            ("Word documents","*.docx"),
+            ("PDF files",     "*.pdf"),
+            ("All files",     "*.*"),
+        ]
+        f = filedialog.askopenfilename(title="Select recipe file", filetypes=ft)
+        if not f:
+            return
+
+        self.configure(cursor="watch")
+        self.update()
+        try:
+            recipes = parse_recipes_from_file(f)
+        except Exception as e:
+            self.configure(cursor="")
+            messagebox.showerror("Error reading file", str(e), parent=self)
+            return
+        self.configure(cursor="")
+
+        if not recipes:
+            messagebox.showinfo(
+                "No recipes found",
+                "Could not detect any recipe sections in that file.\n\n"
+                "Tips for .txt files:\n"
+                "  • Put each recipe name on its own line followed by '---'\n"
+                "  • Or number them:  1. Recipe Name\n"
+                "  • Or use ALL CAPS names on their own line",
+                parent=self)
+            return
+
+        pdf_path = Path(f) if f.lower().endswith(".pdf") else None
+        dlg = ImportDialog(self, recipes, pdf_path=pdf_path)
+        imported = dlg.result
+        if not imported:
+            return
+
+        existing = {ph["path"] for ph in self._photos}
+        added = 0
+        for ph in imported:
+            if ph["path"] not in existing:
+                self._photos.append(ph)
+                added += 1
+
+        self._refresh_lb()
+        if added and self._sel is None and self._photos:
+            self._lb.selection_set(0)
+            self._on_select(None)
+
+        messagebox.showinfo(
+            "Recipes imported",
+            f"Added {added} recipe{'s' if added != 1 else ''} to your cookbook.\n"
+            "You can now edit names, content, or swap photos in the editor on the right.",
+            parent=self)
+
     # ── build ────────────────────────────────────────────────────────────────────
 
     def _start_build(self):
@@ -1935,6 +2237,252 @@ class App(tk.Tk):
         self._log_widget.configure(state="normal")
         self._log_widget.delete("1.0","end")
         self._log_widget.configure(state="disabled")
+
+
+# ── import dialog ──────────────────────────────────────────────────────────────
+
+class ImportDialog(tk.Toplevel):
+    """
+    Modal dialog shown after parsing a recipe file.
+    Lists every parsed recipe and lets the user assign a photo to each one.
+    Supports:
+      • Manual Browse per recipe
+      • Auto-assign from a folder (alphabetical order)
+      • Auto-extract photos embedded in a PDF
+    """
+
+    def __init__(self, parent, recipes, pdf_path=None):
+        super().__init__(parent)
+        self.title("Import Recipes")
+        self.configure(bg=BG)
+        self.resizable(True, True)
+        self.geometry("960x660")
+        self.minsize(720, 480)
+        self.transient(parent)
+        self.grab_set()
+
+        self._recipes    = [dict(r) for r in recipes]
+        self._pdf_path   = pdf_path          # set when source was a PDF
+        self._photo_vars = []                # StringVar per recipe
+        self._name_vars  = []                # StringVar per recipe
+        self._status_lbl = {}               # idx -> tk.Label
+        self._result     = None              # filled on confirm
+
+        self._build()
+        self.wait_window()
+
+    @property
+    def result(self):
+        return self._result
+
+    # ── layout ─────────────────────────────────────────────────────────────────
+
+    def _build(self):
+        n = len(self._recipes)
+
+        # Header
+        hdr = tk.Frame(self, bg=PANEL, pady=10)
+        hdr.pack(fill="x")
+        tk.Label(hdr, text=f"Found {n} recipe{'s' if n != 1 else ''}",
+                 bg=PANEL, fg=ACCENT, font=("Georgia", 17, "italic")).pack()
+        tk.Label(hdr,
+                 text="Assign a food photo to each recipe — or use the helpers below.",
+                 bg=PANEL, fg=MUTED, font=("Segoe UI", 9)).pack(pady=(2, 0))
+
+        # Toolbar
+        tbar = tk.Frame(self, bg=CARD, pady=8, padx=10)
+        tbar.pack(fill="x")
+        _btn(tbar, "📁  Auto-assign from folder…",
+             self._auto_assign_folder).pack(side="left", padx=(0, 6))
+        if self._pdf_path:
+            _btn(tbar, "📄  Extract photos from this PDF",
+                 self._extract_pdf_photos).pack(side="left", padx=(0, 6))
+        tk.Label(tbar,
+                 text="  Photos assigned left-to-right to recipes in order",
+                 bg=CARD, fg=MUTED, font=("Segoe UI", 8)).pack(side="left")
+
+        # Scrollable recipe list
+        outer = tk.Frame(self, bg=BG)
+        outer.pack(fill="both", expand=True, padx=10, pady=6)
+        outer.columnconfigure(0, weight=1)
+        outer.rowconfigure(0, weight=1)
+
+        canvas = tk.Canvas(outer, bg=BG, highlightthickness=0)
+        vsb    = ttk.Scrollbar(outer, orient="vertical", command=canvas.yview)
+        canvas.configure(yscrollcommand=vsb.set)
+        canvas.grid(row=0, column=0, sticky="nsew")
+        vsb.grid(row=0, column=1, sticky="ns")
+
+        inner  = tk.Frame(canvas, bg=BG)
+        inner.columnconfigure(0, weight=1)
+        win_id = canvas.create_window((0, 0), window=inner, anchor="nw")
+
+        inner.bind("<Configure>",  lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
+        canvas.bind("<Configure>", lambda e: canvas.itemconfig(win_id, width=e.width))
+        canvas.bind("<Enter>", lambda _: canvas.bind_all(
+            "<MouseWheel>", lambda e: canvas.yview_scroll(int(-1 * (e.delta / 120)), "units")))
+        canvas.bind("<Leave>", lambda _: canvas.unbind_all("<MouseWheel>"))
+
+        for idx, recipe in enumerate(self._recipes):
+            pv = tk.StringVar()
+            nv = tk.StringVar(value=recipe.get("name", ""))
+            self._photo_vars.append(pv)
+            self._name_vars.append(nv)
+            self._build_row(inner, idx, nv, pv, recipe.get("text", ""))
+
+        # Footer
+        foot = tk.Frame(self, bg=PANEL, pady=10)
+        foot.pack(fill="x")
+        _btn(foot, "✓  Import All Recipes", self._do_import).pack(side="left", padx=(20, 8))
+        _btn(foot, "Cancel", self.destroy, danger=True).pack(side="left", padx=4)
+        tk.Label(foot,
+                 text="  Recipes without a photo will be skipped during Generate.",
+                 bg=PANEL, fg=MUTED, font=("Segoe UI", 8)).pack(side="left", padx=10)
+
+    def _build_row(self, parent, idx, name_var, photo_var, content):
+        row_bg = CARD if idx % 2 == 0 else PANEL
+        row    = tk.Frame(parent, bg=row_bg, pady=8, padx=10)
+        row.grid(row=idx, column=0, sticky="ew", pady=1)
+        row.columnconfigure(1, weight=1)
+
+        # Number badge
+        tk.Label(row, text=f"{idx + 1:02d}", bg=row_bg, fg=ACCENT,
+                 font=("Georgia", 14, "bold"), width=3,
+                 anchor="n").grid(row=0, column=0, rowspan=3, sticky="nw", padx=(0, 10))
+
+        # Name entry
+        name_frame = tk.Frame(row, bg=row_bg)
+        name_frame.grid(row=0, column=1, sticky="ew", pady=(0, 2))
+        name_frame.columnconfigure(0, weight=1)
+        tk.Label(name_frame, text="Recipe name:",
+                 bg=row_bg, fg=MUTED, font=("Segoe UI", 8)).grid(row=0, column=0, sticky="w")
+        tk.Entry(name_frame, textvariable=name_var,
+                 bg=ENTRY, fg=FG, insertbackground=FG,
+                 relief="flat", font=("Georgia", 11)).grid(row=1, column=0, sticky="ew")
+
+        # Content preview
+        preview = (content[:140].replace("\n", "  ").strip() + ("…" if len(content) > 140 else ""))
+        tk.Label(row, text=preview, bg=row_bg, fg=MUTED,
+                 font=("Segoe UI", 8), anchor="w",
+                 wraplength=560, justify="left").grid(row=1, column=1, sticky="w", pady=(0, 4))
+
+        # Photo picker row
+        ph_row = tk.Frame(row, bg=row_bg)
+        ph_row.grid(row=2, column=1, sticky="ew")
+        ph_row.columnconfigure(1, weight=1)
+
+        tk.Label(ph_row, text="📷 Photo:", bg=row_bg, fg=FG,
+                 font=("Segoe UI", 9)).grid(row=0, column=0, padx=(0, 6))
+
+        tk.Entry(ph_row, textvariable=photo_var,
+                 bg=ENTRY, fg=FG, insertbackground=FG,
+                 relief="flat", font=("Segoe UI", 8)).grid(row=0, column=1, sticky="ew")
+
+        status = tk.Label(ph_row, text="(none)", bg=row_bg, fg=MUTED,
+                          font=("Segoe UI", 8), width=6, anchor="w")
+        status.grid(row=0, column=3, padx=(6, 0))
+        self._status_lbl[idx] = status
+
+        def _browse(pv=photo_var, sl=status):
+            f = filedialog.askopenfilename(
+                title="Select photo for this recipe",
+                filetypes=[("Images", "*.jpg *.jpeg *.png *.webp *.bmp"), ("All", "*.*")])
+            if f:
+                pv.set(f)
+                sl.configure(text="✓", fg="#6dbe45")
+
+        def _on_change(*_, pv=photo_var, sl=status):
+            p = pv.get().strip()
+            if p and Path(p).exists():
+                sl.configure(text="✓", fg="#6dbe45")
+            else:
+                sl.configure(text="(none)", fg=MUTED)
+
+        photo_var.trace_add("write", _on_change)
+        _btn(ph_row, "Browse…", _browse).grid(row=0, column=2, padx=(6, 0))
+
+    # ── helpers ─────────────────────────────────────────────────────────────────
+
+    def _assign_photos(self, img_paths):
+        """Assign a list of image paths to recipes in order."""
+        for i, pv in enumerate(self._photo_vars):
+            if i < len(img_paths):
+                pv.set(str(img_paths[i]))
+                if i in self._status_lbl:
+                    self._status_lbl[i].configure(text="✓", fg="#6dbe45")
+        n_done    = min(len(img_paths), len(self._photo_vars))
+        n_missing = max(0, len(self._photo_vars) - len(img_paths))
+        msg = f"Assigned {n_done} photo{'s' if n_done != 1 else ''}."
+        if n_missing:
+            msg += f"\n{n_missing} recipe{'s' if n_missing != 1 else ''} still need a photo."
+        messagebox.showinfo("Photos assigned", msg, parent=self)
+
+    def _auto_assign_folder(self):
+        d = filedialog.askdirectory(title="Select folder of food photos")
+        if not d:
+            return
+        imgs = sorted(
+            [f for f in Path(d).iterdir() if f.suffix.lower() in SUPPORTED_IMG],
+            key=lambda p: p.name)
+        if not imgs:
+            messagebox.showinfo("No images",
+                "No supported images found in that folder.", parent=self)
+            return
+        self._assign_photos(imgs)
+
+    def _extract_pdf_photos(self):
+        if not self._pdf_path:
+            return
+        self.configure(cursor="watch")
+        self.update()
+        imgs = extract_images_from_pdf(self._pdf_path)
+        self.configure(cursor="")
+        if not imgs:
+            messagebox.showinfo(
+                "No images found",
+                "No embedded images were found in the PDF.\n\n"
+                "The PDF may use scanned pages (not extractable) or vector graphics.\n"
+                "Try 'Auto-assign from folder' with exported page images instead.",
+                parent=self)
+            return
+        self._assign_photos(imgs)
+
+    def _do_import(self):
+        results  = []
+        no_photo = []
+        for i, recipe in enumerate(self._recipes):
+            name      = self._name_vars[i].get().strip()
+            photo_str = self._photo_vars[i].get().strip()
+            p         = Path(photo_str) if photo_str else None
+            if p and p.exists():
+                results.append({"path": p, "name": name, "text": recipe["text"]})
+            else:
+                no_photo.append(name or f"Recipe {i + 1}")
+
+        if no_photo:
+            bullet_list = "\n".join(f"  • {n}" for n in no_photo[:8])
+            if len(no_photo) > 8:
+                bullet_list += f"\n  … and {len(no_photo) - 8} more"
+            if results:
+                ok = messagebox.askyesno(
+                    "Some recipes have no photo",
+                    f"{len(no_photo)} recipe(s) have no photo and will be skipped:\n"
+                    f"{bullet_list}\n\n"
+                    f"Import the {len(results)} recipe(s) that do have photos?",
+                    parent=self)
+                if not ok:
+                    return
+            else:
+                messagebox.showerror(
+                    "No photos assigned",
+                    "No recipes have photos assigned.\n"
+                    "Please assign at least one photo before importing.",
+                    parent=self)
+                return
+
+        if results:
+            self._result = results
+            self.destroy()
 
 
 # ── entry point ────────────────────────────────────────────────────────────────

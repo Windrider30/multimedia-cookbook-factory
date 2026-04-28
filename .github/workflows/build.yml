@@ -1,6 +1,6 @@
 name: Build Executables
 
-# Runs automatically when you push a version tag  (e.g. git tag v1.0 && git push --tags)
+# Runs automatically when you push a version tag  (e.g. git tag v1.1 && git push --tags)
 # Can also be triggered manually from the Actions tab in GitHub.
 on:
   push:
@@ -23,7 +23,7 @@ jobs:
           python-version: '3.11'
 
       - name: Install dependencies
-        run: pip install pillow certifi pyinstaller
+        run: pip install pillow certifi python-docx pypdf pyinstaller
 
       - name: Build Mac app
         run: |
@@ -38,6 +38,10 @@ jobs:
             --hidden-import PIL.ImageFont \
             --hidden-import PIL.ImageTk \
             --hidden-import certifi \
+            --hidden-import docx \
+            --hidden-import docx.oxml \
+            --hidden-import docx.oxml.ns \
+            --hidden-import pypdf \
             --hidden-import tkinter \
             --hidden-import tkinter.ttk \
             --hidden-import tkinter.colorchooser \
@@ -69,7 +73,7 @@ jobs:
           python-version: '3.11'
 
       - name: Install dependencies
-        run: pip install pillow certifi pyinstaller
+        run: pip install pillow certifi python-docx pypdf pyinstaller
 
       - name: Build Windows exe
         run: |
@@ -84,6 +88,10 @@ jobs:
             --hidden-import PIL.ImageFont `
             --hidden-import PIL.ImageTk `
             --hidden-import certifi `
+            --hidden-import docx `
+            --hidden-import docx.oxml `
+            --hidden-import docx.oxml.ns `
+            --hidden-import pypdf `
             cookbook_factory.py
 
       - name: Upload Windows artifact
@@ -122,6 +130,12 @@ jobs:
             |---|---|---|
             | 🍎 macOS | `MultimediaCookbookFactory-Mac.zip` | Unzip → right-click → Open (first run) |
             | 🪟 Windows | `MultimediaCookbookFactory.exe` | Run directly |
+
+            ### What's new in this release
+            - **Import recipes from file** — load .txt, .docx, or .pdf files with multiple recipes
+            - **PDF photo extraction** — pull embedded food photos straight out of a PDF
+            - **Auto-assign from folder** — match a whole folder of photos to recipes in one click
+            - **Change Photo** button in recipe editor for easy swaps
 
             ### Requirements
             - **FFmpeg** must be installed separately for video export:
