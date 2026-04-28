@@ -16,8 +16,9 @@ _frames/
 *_flipbook.html
 assets/
 
-# JS cache (downloaded at runtime)
-.cookbook_factory/
+# JS cache and PDF import temp files (go into user's output folder, not C:)
+.cb_cache/
+_pdf_import/
 
 # OS
 .DS_Store

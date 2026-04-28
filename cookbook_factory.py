@@ -56,19 +56,22 @@ DANGER = "#c03020"
 
 # ── JS library cache ───────────────────────────────────────────────────────────
 
-_JS_CACHE = Path.home() / ".cookbook_factory" / "js_cache"
-_JS_LIBS  = {
+_JS_LIBS = {
     "page-flip":   "https://cdn.jsdelivr.net/npm/page-flip@2.0.7/dist/js/page-flip.browser.js",
     "jspdf":       "https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js",
     "html2canvas": "https://cdnjs.cloudflare.com/ajax/libs/html2canvas/1.4.1/html2canvas.min.js",
 }
 
-def _get_js(name, log=None):
-    """Return JS library text, downloading and caching on first use.
-    Three-strategy SSL fallback fixes macOS bundled-app cert errors."""
+def _get_js(name, cache_dir, log=None):
+    """
+    Return JS library text, downloading and caching on first use.
+    cache_dir — where to store the .js files (chosen by the user, NOT hardcoded to C:).
+    Three-strategy SSL fallback fixes macOS bundled-app cert errors.
+    """
     import ssl
-    _JS_CACHE.mkdir(parents=True, exist_ok=True)
-    cached = _JS_CACHE / f"{name}.js"
+    cache_dir = Path(cache_dir)
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    cached = cache_dir / f"{name}.js"
     if cached.exists():
         return cached.read_text(encoding="utf-8")
     url = _JS_LIBS[name]
@@ -310,7 +313,9 @@ def _split_into_recipes(text):
 def parse_recipes_from_file(path):
     """
     Parse a .txt, .docx, or .pdf file into recipe dicts.
-    Returns: [{"name": str, "text": str}, ...]
+    Returns:
+      [{"name": str, "text": str}, ...]  — normal result
+      None                               — PDF is scanned (no text, may have images)
     """
     path   = Path(path)
     suffix = path.suffix.lower()
@@ -321,6 +326,9 @@ def parse_recipes_from_file(path):
         raw = _read_docx(path)
     elif suffix == ".pdf":
         raw = _read_pdf(path)
+        if not raw.strip():
+            # Scanned PDF — caller should try extract_images_from_pdf instead
+            return None
     else:
         raise ValueError(
             f"Unsupported file type: {suffix}\nSupported formats: .txt  .docx  .pdf")
@@ -344,6 +352,33 @@ def _find_ffmpeg():
     return None
 
 FFMPEG = _find_ffmpeg()
+
+# Preferred page-turn transitions in order — first one supported wins
+_XFADE_PREFERENCE = ["pagecurlup", "fade"]
+
+def _best_xfade_transition(ffmpeg_path):
+    """
+    Return the best xfade transition this FFmpeg build actually supports.
+    Older/stripped builds (e.g. ShareX) don't have pagecurlup — fall back to fade.
+    Result is cached after the first call.
+    """
+    if not ffmpeg_path:
+        return "fade"
+    for transition in _XFADE_PREFERENCE:
+        try:
+            r = subprocess.run(
+                [ffmpeg_path,
+                 "-f", "lavfi", "-i", "color=black:s=4x4:d=2",
+                 "-f", "lavfi", "-i", "color=black:s=4x4:d=2",
+                 "-filter_complex",
+                 f"[0][1]xfade=transition={transition}:duration=1:offset=1[v]",
+                 "-map", "[v]", "-f", "null", "-"],
+                capture_output=True, timeout=10)
+            if r.returncode == 0:
+                return transition
+        except Exception:
+            pass
+    return "fade"   # universal fallback
 
 
 # ── image helpers ──────────────────────────────────────────────────────────────
@@ -914,10 +949,12 @@ def build_html(cfg, log):
                     "if(a.paused){a.play();b.textContent='\\u266a Pause';}"
                     "else{a.pause();b.textContent='\\u266a Music';}}")
 
-    log("  Loading JS libraries …")
-    js_pageflip    = _get_js("page-flip",   log)
-    js_jspdf       = _get_js("jspdf",       log)
-    js_html2canvas = _get_js("html2canvas", log)
+    # JS cache lives inside the user's chosen output folder — never on C: by default
+    js_cache = output_dir / ".cb_cache"
+    log(f"  JS cache → {js_cache}")
+    js_pageflip    = _get_js("page-flip",   js_cache, log)
+    js_jspdf       = _get_js("jspdf",       js_cache, log)
+    js_html2canvas = _get_js("html2canvas", js_cache, log)
 
     import json as _json
     spreads_data = _json.dumps([
@@ -1190,6 +1227,10 @@ def build_video(cfg, log):
     tmp     = cfg["output_dir"] / "_frames"
     tmp.mkdir(exist_ok=True)
 
+    # Detect best transition once — avoids crash on older/stripped FFmpeg builds
+    _xfade = _best_xfade_transition(FFMPEG)
+    log(f"  Transition: {_xfade}")
+
     log("  Rendering cover …")
     render_cover(cfg["cover_img"], cfg["title"], cfg["subtitle"],
                  cfg["font_path"], SPREAD_W, SPREAD_H).save(tmp / "f0000.png")
@@ -1233,7 +1274,7 @@ def build_video(cfg, log):
         offset = (n + 1) * PAGE_DUR + n * TRANS_DUR
         nxt    = f"v{n}"
         filt_parts.append(
-            f"[{last}][{n+1}]xfade=transition=pagecurlup:duration={TRANS_DUR}:offset={offset}[{nxt}]")
+            f"[{last}][{n+1}]xfade=transition={_xfade}:duration={TRANS_DUR}:offset={offset}[{nxt}]")
         last = nxt
 
     filter_complex = ";".join(filt_parts)
@@ -2077,6 +2118,7 @@ class App(tk.Tk):
         """
         Parse a .txt / .docx / .pdf into recipes, then open ImportDialog
         so the user can assign photos before adding them to the project.
+        Handles scanned PDFs by extracting embedded images as photo slots.
         """
         ft = [
             ("Recipe files",  "*.txt *.docx *.pdf"),
@@ -2099,7 +2141,51 @@ class App(tk.Tk):
             return
         self.configure(cursor="")
 
-        if not recipes:
+        pdf_path     = Path(f) if f.lower().endswith(".pdf") else None
+        preset_imgs  = []
+
+        # ── Scanned PDF: recipes is None (no extractable text) ─────────────────
+        if recipes is None:
+            # Work out where to save extracted images — user's output folder,
+            # or a subfolder next to the PDF if no output folder is set yet.
+            out_base = self.v_output.get().strip()
+            if out_base:
+                pdf_img_dir = Path(out_base) / "_pdf_import"
+            else:
+                pdf_img_dir = Path(f).parent / "_pdf_import"
+            pdf_img_dir.mkdir(parents=True, exist_ok=True)
+
+            # Extract embedded images from the PDF pages
+            self.configure(cursor="watch")
+            self.update()
+            imgs = extract_images_from_pdf(Path(f), output_dir=pdf_img_dir)
+            self.configure(cursor="")
+
+            if not imgs:
+                messagebox.showerror(
+                    "Scanned PDF — no images found",
+                    "This PDF contains scanned pages (images, not text) and no\n"
+                    "extractable embedded images were found either.\n\n"
+                    "Options:\n"
+                    "  • Export the PDF pages as JPG/PNG images and use\n"
+                    "    'Load Folder' or 'Add Photos' instead.\n"
+                    "  • Use a PDF with selectable text for recipe content.",
+                    parent=self)
+                return
+
+            # One blank recipe slot per extracted image
+            recipes     = [{"name": f"Recipe {i+1}", "text": ""} for i in range(len(imgs))]
+            preset_imgs = imgs
+            messagebox.showinfo(
+                "Scanned PDF detected",
+                f"This PDF is scanned (image-based), so recipe text could not be read.\n\n"
+                f"Found {len(imgs)} embedded image{'s' if len(imgs)!=1 else ''} — "
+                f"each has been assigned as a recipe photo.\n\n"
+                f"Enter the recipe name and content for each page in the editor after importing.",
+                parent=self)
+
+        # ── Normal case: no recipes detected in a text file ────────────────────
+        elif not recipes:
             messagebox.showinfo(
                 "No recipes found",
                 "Could not detect any recipe sections in that file.\n\n"
@@ -2110,8 +2196,7 @@ class App(tk.Tk):
                 parent=self)
             return
 
-        pdf_path = Path(f) if f.lower().endswith(".pdf") else None
-        dlg = ImportDialog(self, recipes, pdf_path=pdf_path)
+        dlg = ImportDialog(self, recipes, pdf_path=pdf_path, preset_photos=preset_imgs)
         imported = dlg.result
         if not imported:
             return
@@ -2251,7 +2336,7 @@ class ImportDialog(tk.Toplevel):
       • Auto-extract photos embedded in a PDF
     """
 
-    def __init__(self, parent, recipes, pdf_path=None):
+    def __init__(self, parent, recipes, pdf_path=None, preset_photos=None):
         super().__init__(parent)
         self.title("Import Recipes")
         self.configure(bg=BG)
@@ -2261,14 +2346,19 @@ class ImportDialog(tk.Toplevel):
         self.transient(parent)
         self.grab_set()
 
-        self._recipes    = [dict(r) for r in recipes]
-        self._pdf_path   = pdf_path          # set when source was a PDF
-        self._photo_vars = []                # StringVar per recipe
-        self._name_vars  = []                # StringVar per recipe
-        self._status_lbl = {}               # idx -> tk.Label
-        self._result     = None              # filled on confirm
+        self._recipes       = [dict(r) for r in recipes]
+        self._pdf_path      = pdf_path          # set when source was a PDF
+        self._preset_photos = preset_photos or []  # pre-assigned image paths
+        self._photo_vars    = []                # StringVar per recipe
+        self._name_vars     = []                # StringVar per recipe
+        self._status_lbl    = {}                # idx -> tk.Label
+        self._result        = None              # filled on confirm
 
         self._build()
+        # Apply any pre-assigned photos after widgets exist
+        for i, img_path in enumerate(self._preset_photos):
+            if i < len(self._photo_vars):
+                self._photo_vars[i].set(str(img_path))
         self.wait_window()
 
     @property
@@ -2433,9 +2523,12 @@ class ImportDialog(tk.Toplevel):
     def _extract_pdf_photos(self):
         if not self._pdf_path:
             return
+        # Save extracted images alongside the PDF so nothing lands on C:
+        pdf_img_dir = self._pdf_path.parent / "_pdf_import"
+        pdf_img_dir.mkdir(parents=True, exist_ok=True)
         self.configure(cursor="watch")
         self.update()
-        imgs = extract_images_from_pdf(self._pdf_path)
+        imgs = extract_images_from_pdf(self._pdf_path, output_dir=pdf_img_dir)
         self.configure(cursor="")
         if not imgs:
             messagebox.showinfo(
