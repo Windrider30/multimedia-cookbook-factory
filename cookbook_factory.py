@@ -6,9 +6,11 @@ Outputs an interactive HTML flipbook and an MP4 video.
 """
 
 import base64
+import os
 import re
 import shutil
 import subprocess
+import sys
 import threading
 import traceback
 import urllib.request
@@ -18,6 +20,18 @@ import tkinter as tk
 from tkinter import colorchooser, filedialog, messagebox, ttk
 
 from PIL import Image, ImageDraw, ImageFilter, ImageFont, ImageTk
+
+
+def _app_dir() -> Path:
+    """
+    Return the folder that contains the running exe (PyInstaller) or script.
+    This is where we default all output so nothing ever spills into Downloads.
+    """
+    if getattr(sys, "frozen", False):
+        # PyInstaller one-file bundle: sys.executable is the exe itself
+        return Path(sys.executable).parent
+    # Running from source
+    return Path(sys.argv[0]).resolve().parent
 
 
 # ── constants ──────────────────────────────────────────────────────────────────
@@ -1667,7 +1681,7 @@ class App(tk.Tk):
         self.v_cover        = tk.StringVar()
         self.v_back         = tk.StringVar()
         self.v_music        = tk.StringVar()
-        self.v_output       = tk.StringVar()
+        self.v_output       = tk.StringVar(value=str(_app_dir()))
         self.v_title        = tk.StringVar()
         self.v_subtitle     = tk.StringVar()
         self.v_author_name  = tk.StringVar()
@@ -2486,7 +2500,7 @@ class App(tk.Tk):
             n_urls     = sum(1 for u in urls_found if u.startswith(("http://", "https://")))
             if n_urls:
                 out_base = self.v_output.get().strip()
-                dl_dir   = (Path(out_base) if out_base else Path(f).parent) / "_csv_photos"
+                dl_dir   = (Path(out_base) if out_base else _app_dir()) / "_csv_photos"
                 dl_dir.mkdir(parents=True, exist_ok=True)
 
                 if messagebox.askyesno(
@@ -2520,7 +2534,7 @@ class App(tk.Tk):
         # ── Step 3 (scanned PDF): extract embedded images ──────────────────────
         elif recipes is None:
             out_base = self.v_output.get().strip()
-            pdf_img_dir = (Path(out_base) if out_base else Path(f).parent) / "_pdf_import"
+            pdf_img_dir = (Path(out_base) if out_base else _app_dir()) / "_pdf_import"
             pdf_img_dir.mkdir(parents=True, exist_ok=True)
 
             imgs = self._run_threaded(
@@ -2915,7 +2929,7 @@ class ImportDialog(tk.Toplevel):
     def _extract_pdf_photos(self):
         if not self._pdf_path:
             return
-        pdf_img_dir = self._pdf_path.parent / "_pdf_import"
+        pdf_img_dir = _app_dir() / "_pdf_import"
         pdf_img_dir.mkdir(parents=True, exist_ok=True)
         # Run in background so the dialog doesn't freeze
         busy = _BusyDialog(self, "Extracting images from PDF …")
