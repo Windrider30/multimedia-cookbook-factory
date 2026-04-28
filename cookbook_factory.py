@@ -310,33 +310,150 @@ def _split_into_recipes(text):
     return result if result else [{"name": "", "text": text.strip()}]
 
 
+def _read_csv(path):
+    """
+    Parse a CSV file into recipe dicts.
+    Detects columns by header name (case-insensitive) with positional fallback.
+    Returns: [{"name": str, "text": str, "photo_url": str}, ...]
+    """
+    import csv
+
+    _NAME_COLS    = {"name","title","recipe_name","recipe name","recipe"}
+    _CONTENT_COLS = {"content","description","text","ingredients","body",
+                     "recipe_text","recipe text","instructions","recipe_content",
+                     "directions","method"}
+    _PHOTO_COLS   = {"photo","image","photo_url","image_url","url","link",
+                     "photo_link","image_link","picture","picture_url","img","img_url"}
+
+    with open(path, newline="", encoding="utf-8-sig", errors="replace") as fh:
+        sample = fh.read(8192); fh.seek(0)
+        try:
+            dialect = csv.Sniffer().sniff(sample)
+        except csv.Error:
+            dialect = csv.excel
+
+        reader = csv.DictReader(fh, dialect=dialect)
+        if not reader.fieldnames:
+            raise ValueError("CSV has no header row or could not be read.")
+
+        # Map lower-cased header → original header
+        lower_map = {fn.strip().lower(): fn for fn in reader.fieldnames if fn}
+
+        name_col    = next((lower_map[k] for k in _NAME_COLS    if k in lower_map), None)
+        content_col = next((lower_map[k] for k in _CONTENT_COLS if k in lower_map), None)
+        photo_col   = next((lower_map[k] for k in _PHOTO_COLS   if k in lower_map), None)
+
+        # Positional fallback if headers weren't recognised
+        cols = [fn for fn in reader.fieldnames if fn]
+        if not name_col    and len(cols) >= 1: name_col    = cols[0]
+        if not content_col and len(cols) >= 2: content_col = cols[1]
+        if not photo_col   and len(cols) >= 3: photo_col   = cols[2]
+
+        recipes = []
+        for row in reader:
+            name      = row.get(name_col,    "").strip() if name_col    else ""
+            text      = row.get(content_col, "").strip() if content_col else ""
+            photo_url = row.get(photo_col,   "").strip() if photo_col   else ""
+            if name or text:
+                recipes.append({"name": name, "text": text, "photo_url": photo_url})
+
+    return recipes
+
+
+def _download_photo(url, save_dir, index, log=None):
+    """
+    Download a photo from a URL into save_dir.
+    Returns Path on success, None on failure.
+    Never writes to C: — save_dir is always the user's chosen folder.
+    """
+    import ssl
+    if not url or not url.strip().startswith(("http://", "https://")):
+        return None
+    url = url.strip()
+    try:
+        # SSL: try certifi first, then unverified fallback
+        def _fetch(ctx=None):
+            kw = {"context": ctx} if ctx else {}
+            with urllib.request.urlopen(url, timeout=30, **kw) as resp:
+                data         = resp.read()
+                content_type = resp.headers.get("Content-Type", "").split(";")[0].strip()
+                return data, content_type
+
+        data = ct = None
+        for attempt in [lambda: _fetch(),
+                         lambda: _fetch(ssl.create_default_context(
+                             cafile=__import__("certifi").where())),
+                         lambda: _fetch(_make_unverified_ctx())]:
+            try:
+                data, ct = attempt()
+                break
+            except Exception:
+                pass
+
+        if data is None:
+            if log: log(f"  ✗ Could not download: {url[:60]}")
+            return None
+
+        # Determine file extension
+        ext = {
+            "image/jpeg":"jpg","image/jpg":"jpg","image/png":"png",
+            "image/webp":"webp","image/gif":"gif","image/bmp":"bmp",
+        }.get(ct, "")
+        if not ext:
+            from urllib.parse import urlparse
+            url_ext = Path(urlparse(url).path).suffix.lower().lstrip(".")
+            ext = url_ext if url_ext in {"jpg","jpeg","png","webp","bmp","gif"} else "jpg"
+
+        save_dir = Path(save_dir)
+        save_dir.mkdir(parents=True, exist_ok=True)
+        out = save_dir / f"recipe_{index:03d}.{ext}"
+        out.write_bytes(data)
+        if log: log(f"  ✓ Downloaded: {out.name}")
+        return out
+
+    except Exception as e:
+        if log: log(f"  ✗ Failed ({url[:50]}…): {e}")
+        return None
+
+
+def _make_unverified_ctx():
+    import ssl
+    ctx = ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode    = ssl.CERT_NONE
+    return ctx
+
+
 def parse_recipes_from_file(path):
     """
-    Parse a .txt, .docx, or .pdf file into recipe dicts.
+    Parse a .txt, .docx, .pdf, or .csv file into recipe dicts.
     Returns:
-      [{"name": str, "text": str}, ...]  — normal result
-      None                               — PDF is scanned (no text, may have images)
+      [{"name": str, "text": str, "photo_url": str}, ...]  — normal result
+      None   — PDF is scanned/image-based (caller tries extract_images_from_pdf)
     """
     path   = Path(path)
     suffix = path.suffix.lower()
 
-    if suffix == ".txt":
+    if suffix == ".csv":
+        return _read_csv(path)        # already returns full dicts with photo_url
+    elif suffix == ".txt":
         raw = path.read_text(encoding="utf-8", errors="replace")
     elif suffix == ".docx":
         raw = _read_docx(path)
     elif suffix == ".pdf":
         raw = _read_pdf(path)
         if not raw.strip():
-            # Scanned PDF — caller should try extract_images_from_pdf instead
-            return None
+            return None               # scanned — caller handles image extraction
     else:
         raise ValueError(
-            f"Unsupported file type: {suffix}\nSupported formats: .txt  .docx  .pdf")
+            f"Unsupported file type: {suffix}\n"
+            f"Supported formats: .csv  .txt  .docx  .pdf")
 
     if not raw.strip():
         raise ValueError("The file appears to be empty or has no readable text.")
 
-    return _split_into_recipes(raw)
+    # Text-based formats don't carry photo URLs
+    return [dict(r, photo_url="") for r in _split_into_recipes(raw)]
 
 
 # ───────────────────────────────────────────────────────────────────────────────
@@ -1590,7 +1707,7 @@ class App(tk.Tk):
         _btn(bar, "📄  Load from File",  self._import_from_file).pack(side="left", padx=4)
         _btn(bar, "✕  Clear All",        self._clear_photos, danger=True).pack(side="left", padx=4)
         tk.Label(bar,
-                 text="  Load Folder / Add Photos for images · Load from File imports .txt/.docx/.pdf recipes",
+                 text="  Load Folder / Add Photos for images · Load from File imports .csv/.txt/.docx/.pdf",
                  bg=CARD, fg=MUTED, font=("Segoe UI",8)).pack(side="left", padx=8)
 
         left = tk.Frame(p, bg=CARD, width=270)
@@ -2277,11 +2394,12 @@ class App(tk.Tk):
         Handles scanned PDFs by extracting embedded images as photo slots.
         """
         ft = [
-            ("Recipe files",  "*.txt *.docx *.pdf"),
-            ("Text files",    "*.txt"),
-            ("Word documents","*.docx"),
-            ("PDF files",     "*.pdf"),
-            ("All files",     "*.*"),
+            ("Recipe files",   "*.csv *.txt *.docx *.pdf"),
+            ("CSV spreadsheet","*.csv"),
+            ("Text files",     "*.txt"),
+            ("Word documents", "*.docx"),
+            ("PDF files",      "*.pdf"),
+            ("All files",      "*.*"),
         ]
         f = filedialog.askopenfilename(title="Select recipe file", filetypes=ft)
         if not f:
@@ -2297,8 +2415,49 @@ class App(tk.Tk):
             return
         self.configure(cursor="")
 
-        pdf_path     = Path(f) if f.lower().endswith(".pdf") else None
-        preset_imgs  = []
+        pdf_path    = Path(f) if f.lower().endswith(".pdf") else None
+        preset_imgs = []
+
+        # ── CSV: download any photo URLs before opening the dialog ──────────────
+        if f.lower().endswith(".csv") and recipes:
+            urls_found = [r.get("photo_url","").strip() for r in recipes]
+            has_urls   = any(u.startswith(("http://","https://")) for u in urls_found)
+            if has_urls:
+                # Save into output folder / _csv_photos, or next to the CSV
+                out_base = self.v_output.get().strip()
+                dl_dir   = (Path(out_base) if out_base else Path(f).parent) / "_csv_photos"
+                dl_dir.mkdir(parents=True, exist_ok=True)
+
+                n_urls = sum(1 for u in urls_found if u.startswith(("http://","https://")))
+                if not messagebox.askyesno(
+                        "Download photos from URLs?",
+                        f"Found {n_urls} photo URL{'s' if n_urls!=1 else ''} in the CSV.\n\n"
+                        f"Download them now?\n"
+                        f"They will be saved to:\n  {dl_dir}",
+                        parent=self):
+                    # User said no — keep URLs as-is but don't download
+                    pass
+                else:
+                    self.configure(cursor="watch")
+                    self.update()
+                    downloaded = []
+                    for idx, url in enumerate(urls_found):
+                        if url.startswith(("http://","https://")):
+                            p = _download_photo(url, dl_dir, idx + 1)
+                            downloaded.append(p)   # None if download failed
+                        else:
+                            downloaded.append(None)
+                    self.configure(cursor="")
+
+                    ok  = sum(1 for p in downloaded if p is not None)
+                    bad = n_urls - ok
+                    # Keep per-recipe alignment: None slots stay empty in the dialog
+                    preset_imgs = downloaded   # list of Path-or-None, one per recipe
+
+                    msg = f"Downloaded {ok} of {n_urls} photo{'s' if n_urls!=1 else ''}."
+                    if bad:
+                        msg += f"\n{bad} failed — you can assign those manually in the next step."
+                    messagebox.showinfo("Photos downloaded", msg, parent=self)
 
         # ── Scanned PDF: recipes is None (no extractable text) ─────────────────
         if recipes is None:
@@ -2511,9 +2670,9 @@ class ImportDialog(tk.Toplevel):
         self._result        = None              # filled on confirm
 
         self._build()
-        # Apply any pre-assigned photos after widgets exist
+        # Apply any pre-assigned photos after widgets exist (None = leave blank)
         for i, img_path in enumerate(self._preset_photos):
-            if i < len(self._photo_vars):
+            if i < len(self._photo_vars) and img_path is not None:
                 self._photo_vars[i].set(str(img_path))
         self.wait_window()
 

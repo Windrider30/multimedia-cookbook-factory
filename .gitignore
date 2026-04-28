@@ -16,9 +16,10 @@ _frames/
 *_flipbook.html
 assets/
 
-# JS cache and PDF import temp files (go into user's output folder, not C:)
+# Working files — go into user's output folder, never C:
 .cb_cache/
 _pdf_import/
+_csv_photos/
 
 # OS
 .DS_Store
