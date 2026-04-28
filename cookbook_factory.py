@@ -171,11 +171,13 @@ def extract_images_from_pdf(path, log=None, output_dir=None):
         out_dir.mkdir(parents=True, exist_ok=True)
     else:
         out_dir = Path(tempfile.mkdtemp(prefix="cb_pdf_imgs_"))
-    saved   = []
+    saved      = []
+    seen_names = set()   # deduplicate: many PDFs expose all images on every page
 
     try:
         with open(path, "rb") as fh:
             reader = pypdf.PdfReader(fh)
+            img_counter = 0
             for pg_num, page in enumerate(reader.pages):
                 try:
                     page_imgs = page.images          # pypdf >= 3.0
@@ -183,10 +185,15 @@ def extract_images_from_pdf(path, log=None, output_dir=None):
                     continue                          # older pypdf — skip
                 for img_obj in page_imgs:
                     try:
-                        safe_name = re.sub(r'[^\w\-.]', '_', img_obj.name or "img")
-                        out_path  = out_dir / f"p{pg_num:03d}_{safe_name}"
+                        raw_name = img_obj.name or "img"
+                        if raw_name in seen_names:
+                            continue                 # already saved this image
+                        seen_names.add(raw_name)
+                        img_counter += 1
+                        safe_name = re.sub(r'[^\w\-.]', '_', raw_name)
+                        out_path  = out_dir / f"{img_counter:03d}_{safe_name}"
                         # Ensure a supported image extension
-                        if not out_path.suffix.lower() in SUPPORTED_IMG:
+                        if out_path.suffix.lower() not in SUPPORTED_IMG:
                             out_path = out_path.with_suffix(".png")
                         img_obj.image.save(str(out_path))
                         saved.append(out_path)
@@ -2698,12 +2705,14 @@ class _BusyDialog(tk.Toplevel):
         tk.Label(self, text=message, bg=PANEL, fg=FG,
                  font=("Segoe UI", 11), padx=32, pady=20).pack()
         self.transient(parent)
-        self.grab_set()
+        self.attributes("-topmost", True)   # force on top of main window (Windows)
         self.update_idletasks()
         pw, ph = parent.winfo_width(), parent.winfo_height()
         px, py = parent.winfo_rootx(), parent.winfo_rooty()
-        w, h   = self.winfo_width(), self.winfo_height()
-        self.geometry(f"+{px + (pw - w)//2}+{py + (ph - h)//2}")
+        w, h   = self.winfo_reqwidth(), self.winfo_reqheight()
+        self.geometry(f"{w}x{h}+{px + (pw - w)//2}+{py + (ph - h)//2}")
+        self.grab_set()
+        self.lift()
         self.update()
 
 
