@@ -351,9 +351,10 @@ def _read_csv(path):
 
         recipes = []
         for row in reader:
-            name      = row.get(name_col,    "").strip() if name_col    else ""
-            text      = row.get(content_col, "").strip() if content_col else ""
-            photo_url = row.get(photo_col,   "").strip() if photo_col   else ""
+            # `or ""` guards against None when a cell is blank in csv.DictReader
+            name      = (row.get(name_col)    or "").strip() if name_col    else ""
+            text      = (row.get(content_col) or "").strip() if content_col else ""
+            photo_url = (row.get(photo_col)   or "").strip() if photo_col   else ""
             if name or text:
                 recipes.append({"name": name, "text": text, "photo_url": photo_url})
 
@@ -2444,7 +2445,7 @@ class App(tk.Tk):
 
         # ── Step 2 (CSV only): download photo URLs ─────────────────────────────
         if f.lower().endswith(".csv") and recipes:
-            urls_found = [r.get("photo_url", "").strip() for r in recipes]
+            urls_found = [(r.get("photo_url") or "").strip() for r in recipes]
             n_urls     = sum(1 for u in urls_found if u.startswith(("http://", "https://")))
             if n_urls:
                 out_base = self.v_output.get().strip()
