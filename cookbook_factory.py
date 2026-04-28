@@ -154,9 +154,9 @@ def _read_pdf(path):
     return "\n".join(parts)
 
 
-def extract_images_from_pdf(path, log=None):
+def extract_images_from_pdf(path, log=None, output_dir=None):
     """
-    Extract all embedded images from a PDF into a temp folder.
+    Extract all embedded images from a PDF into output_dir (or a temp folder).
     Returns sorted list of Path objects.
     Uses pypdf >= 3.x  page.images API.
     """
@@ -166,7 +166,11 @@ def extract_images_from_pdf(path, log=None):
         return []
 
     import tempfile
-    out_dir = Path(tempfile.mkdtemp(prefix="cb_pdf_imgs_"))
+    if output_dir is not None:
+        out_dir = Path(output_dir)
+        out_dir.mkdir(parents=True, exist_ok=True)
+    else:
+        out_dir = Path(tempfile.mkdtemp(prefix="cb_pdf_imgs_"))
     saved   = []
 
     try:
